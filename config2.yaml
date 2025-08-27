@@ -1,0 +1,34 @@
+counting_zone:
+- - 94
+  - 342
+- - 211
+  - 147
+- - 267
+  - 50
+- - 323
+  - 41
+- - 556
+  - 331
+device_id: 8554fdsf456ds
+direction_lines:
+- line:
+  - - 0
+    - 135
+  - - 480
+    - 135
+  name: Left to Right
+- line:
+  - - 240
+    - 50
+  - - 240
+    - 270
+  name: Top to Bottom
+roi_polygon:
+- - 0
+  - 50
+- - 480
+  - 50
+- - 480
+  - 270
+- - 0
+  - 270
