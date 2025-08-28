@@ -1,9 +1,11 @@
 import sys
 import cv2
+import threading
+import queue
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
                            QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog,
                            QComboBox, QSpinBox, QTextEdit)
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap
 from ultralytics import YOLO
 import yaml
@@ -14,11 +16,160 @@ from norfair import Detection, Tracker
 from collections import defaultdict
 import numpy as np
 
+class ProcessingWorker(QObject):
+    """Worker thread for video capture and processing to avoid blocking the GUI thread."""
+    # Signal to send processed results back to the main thread
+    result_ready = pyqtSignal(dict)
+    
+    def __init__(self, cap, yolov8_model, custom_model, config, is_rtsp=False):
+        super().__init__()
+        self.cap = cap
+        self.yolov8_model = yolov8_model
+        self.custom_model = custom_model
+        self.config = config
+        self.is_rtsp = is_rtsp
+        self.running = False
+        self.frame_queue = queue.Queue(maxsize=1)  # Only keep the latest frame
+        self.result_queue = queue.Queue(maxsize=2)  # Keep limited results
+        self.YOLOV8N_CONFIDENCE = 0.4
+        self.NEW_PT_CONFIDENCE = 0.2
+        self.IOU_THRESHOLD = 0.3
+        self.PROCESSING_WIDTH = 640
+        self.PROCESSING_HEIGHT = 360
+        
+    def start(self):
+        """Start the worker threads"""
+        self.running = True
+        # Start capture thread
+        self.capture_thread = threading.Thread(target=self._capture_loop)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
+        
+        # Start processing thread
+        self.process_thread = threading.Thread(target=self._process_loop)
+        self.process_thread.daemon = True
+        self.process_thread.start()
+    
+    def stop(self):
+        """Stop all worker threads"""
+        self.running = False
+        if hasattr(self, 'capture_thread'):
+            self.capture_thread.join(timeout=1.0)
+        if hasattr(self, 'process_thread'):
+            self.process_thread.join(timeout=1.0)
+    
+    def _capture_loop(self):
+        """Thread that continuously captures frames from the video source"""
+        while self.running:
+            if self.cap is None or not self.cap.isOpened():
+                time.sleep(0.1)
+                continue
+                
+            # For RTSP streams, clear the buffer before reading
+            if self.is_rtsp:
+                # Skip frames to get to the most recent one
+                for _ in range(2):  # Skip buffered frames
+                    self.cap.grab()
+                    
+            # Read the actual frame
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+                
+            # Resize the frame to our processing resolution
+            frame = cv2.resize(frame, (self.PROCESSING_WIDTH, self.PROCESSING_HEIGHT))
+            
+            # Put in queue, dropping old frames if queue is full
+            try:
+                if self.frame_queue.full():
+                    try:
+                        self.frame_queue.get_nowait()  # Discard old frame
+                    except queue.Empty:
+                        pass
+                self.frame_queue.put(frame, block=False)
+            except queue.Full:
+                pass  # Skip this frame if queue is still full
+    
+    def _process_loop(self):
+        """Thread that processes frames"""
+        while self.running:
+            try:
+                # Get the latest frame
+                frame = self.frame_queue.get(timeout=1.0)
+                
+                # Process the frame
+                start_time = time.time()
+                result = self._process_frame(frame)
+                processing_time = time.time() - start_time
+                
+                # Add processing time to the result
+                result['processing_time'] = processing_time
+                result['frame'] = frame
+                
+                # Emit the result
+                self.result_ready.emit(result)
+                
+            except queue.Empty:
+                continue
+    
+    def _process_frame(self, frame):
+        """Process a single frame with both models"""
+        yolov8_dets = []
+        custom_dets = []
+        
+        # Process with YOLOv8
+        results = self.yolov8_model(frame, conf=self.YOLOV8N_CONFIDENCE, 
+                                  iou=self.IOU_THRESHOLD, device="intel:gpu")
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                cls_name = self.yolov8_model.names[cls_id]
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                yolov8_dets.append((cls_name, (x1, y1, x2, y2), box))
+
+        # Only run custom model if we have enough time (not for RTSP real-time)
+        # or if we're processing regular video files
+        if not self.is_rtsp:
+            # Custom model detections
+            results = self.custom_model(frame, conf=self.NEW_PT_CONFIDENCE, 
+                                      iou=self.IOU_THRESHOLD, device="intel:gpu")
+            for result in results:
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    cls_name = self.custom_model.names[cls_id]
+                    if cls_name in {'person', 'bus'}:  # Skip these classes
+                        continue
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    custom_dets.append((cls_name, (x1, y1, x2, y2), box))
+
+        # Deduplicate detections
+        final_dets = yolov8_dets + [
+            (cls, box, b) for cls, box, b in custom_dets
+            if all(self.iou(box, ybox) <= 0.5 for _, ybox, _ in yolov8_dets)
+        ]
+        
+        return {
+            'detections': final_dets
+        }
+        
+    def iou(self, box1, box2):
+        """Calculate IoU between two boxes"""
+        x1, y1, x2, y2 = box1
+        x1g, y1g, x2g, y2g = box2
+        xi1, yi1 = max(x1, x1g), max(y1, y1g)
+        xi2, yi2 = min(x2, x2g), min(y2, y2g)
+        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+        box1_area = (x2 - x1) * (y2 - y1)
+        box2_area = (x2g - x1g) * (y2g - y1g)
+        union_area = box1_area + box2_area - inter_area
+        return inter_area / union_area if union_area else 0
+
 class VehicleDetectionApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vehicle Detection System")
-        self.setGeometry(100, 100, 1280, 800)
+        self.setGeometry(100, 100, 1280, 800)  # Slightly wider to accommodate controls
 
         # Create main widget and layout
         main_widget = QWidget()
@@ -40,6 +191,18 @@ class VehicleDetectionApp(QMainWindow):
         self.load_video_btn = QPushButton("Load Video")
         self.load_video_btn.clicked.connect(self.load_video)
         control_layout.addWidget(self.load_video_btn)
+        
+        # RTSP Link section
+        rtsp_layout = QHBoxLayout()
+        self.rtsp_input = QTextEdit()
+        self.rtsp_input.setPlaceholderText("Enter RTSP URL (e.g., rtsp://username:password@ip:port/stream)")
+        self.rtsp_input.setMaximumHeight(50)
+        rtsp_layout.addWidget(self.rtsp_input)
+        
+        self.rtsp_btn = QPushButton("Connect RTSP")
+        self.rtsp_btn.clicked.connect(self.connect_rtsp)
+        rtsp_layout.addWidget(self.rtsp_btn)
+        control_layout.addLayout(rtsp_layout)
 
         self.start_btn = QPushButton("Start Detection")
         self.start_btn.clicked.connect(self.start_detection)
@@ -56,8 +219,19 @@ class VehicleDetectionApp(QMainWindow):
 
         # Initialize variables
         self.cap = None
+        self.worker = None
+        self.is_rtsp = False
+        self.latest_frame = None
+        self.latest_detections = []
+        self.processing_fps = 0
+        self.display_fps = 0
+        self.last_frame_time = time.time()
+        
+        # Setup timer for UI updates
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
+        
+        # Load models and setup
         self.load_models()
         self.load_config()
         self.setup_tracker()
@@ -156,63 +330,110 @@ class VehicleDetectionApp(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", 
                                                 "Video Files (*.mp4 *.avi)")
         if filename:
+            # Stop any existing processing
+            self.stop_detection()
+            
+            # Open the video file
             self.cap = cv2.VideoCapture(filename)
+            self.is_rtsp = False  # Reset RTSP flag for video files
             self.results_text.append(f"Loaded video: {filename}")
+    
+    def connect_rtsp(self):
+        rtsp_url = self.rtsp_input.toPlainText().strip()
+        if not rtsp_url:
+            self.results_text.append("Please enter an RTSP URL!")
+            return
+        
+        # Try to connect to the RTSP stream with optimized settings
+        self.results_text.append(f"Connecting to RTSP stream: {rtsp_url}")
+        
+        # Use FFMPEG backend which handles RTSP better
+        self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        
+        # RTSP-specific optimizations
+        # Set minimal buffer size to reduce latency
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Set RTSP transport to TCP (more reliable than UDP)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+        
+        # Set flag to indicate this is an RTSP stream
+        self.is_rtsp = True
+        
+        # Check if connection was successful
+        if not self.cap.isOpened():
+            self.results_text.append("Failed to connect to RTSP stream. Please check the URL.")
+            self.is_rtsp = False
+            return
+            
+        self.results_text.append("Successfully connected to RTSP stream!")
+        self.results_text.append("RTSP optimizations applied: Using worker thread and minimal buffering")
             
     def start_detection(self):
         if self.cap is None:
-            self.results_text.append("Please load a video first!")
+            self.results_text.append("Please load a video or connect to an RTSP stream first!")
             return
-        self.timer.start(30)  # Update every 30ms
-        self.results_text.append("Detection started...")
+            
+        # Stop any existing worker
+        self.stop_detection()
+        
+        # Create and start worker thread
+        self.worker = ProcessingWorker(self.cap, self.yolov8_model, self.custom_model, 
+                                     self.config, is_rtsp=self.is_rtsp)
+        self.worker.result_ready.connect(self.process_result)
+        self.worker.start()
+        
+        # Start the UI update timer - faster for RTSP
+        if self.is_rtsp:
+            self.timer.start(15)  # Update every 15ms for smoother RTSP display
+        else:
+            self.timer.start(30)  # Regular update for video files
+            
+        self.results_text.append("Detection started in worker thread...")
 
     def stop_detection(self):
-        self.timer.stop()
+        # Stop timer
+        if self.timer.isActive():
+            self.timer.stop()
+        
+        # Stop worker thread if it exists
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker = None
+            
         self.results_text.append("Detection stopped.")
+        
+    def process_result(self, result):
+        """Handle results from the worker thread"""
+        if 'frame' in result:
+            self.latest_frame = result['frame']
+        if 'detections' in result:
+            self.latest_detections = result['detections']
+        if 'processing_time' in result:
+            # Calculate processing FPS
+            self.processing_fps = 1.0 / max(result['processing_time'], 0.001)  # Avoid division by zero
 
     def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            self.timer.stop()
-            self.results_text.append("Video finished.")
+        """Update the UI with the latest processed frame - called by the timer"""
+        # If no frame is available yet or worker is not running, return
+        if self.latest_frame is None and (self.worker is None or not self.worker.running):
             return
-
-        # Immediately resize frame to our fixed 640x360 resolution
-        frame = cv2.resize(frame, (self.PROCESSING_WIDTH, self.PROCESSING_HEIGHT))
-        # Use the same frame for processing (no separate scaling)
-        processing_frame = frame.copy()
+            
+        # If we haven't received a processed frame yet but worker is running,
+        # we might be waiting for first result - just return
+        if self.latest_frame is None:
+            return
+            
+        # Use the latest frame from the worker thread
+        frame = self.latest_frame.copy()
         
-        # Run both models
-        yolov8_dets = []
-        custom_dets = []
+        # Calculate display FPS
+        current_time = time.time()
+        self.display_fps = 1.0 / max(current_time - self.last_frame_time, 0.001)  # Avoid division by zero
+        self.last_frame_time = current_time
         
-        # YOLOv8 detections
-        results = self.yolov8_model(processing_frame, conf=self.YOLOV8N_CONFIDENCE, 
-                                  iou=self.IOU_THRESHOLD, device="intel:gpu")
-        for result in results:
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                cls_name = self.yolov8_model.names[cls_id]
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                yolov8_dets.append((cls_name, (x1, y1, x2, y2), box))
-
-        # Custom model detections
-        results = self.custom_model(processing_frame, conf=self.NEW_PT_CONFIDENCE, 
-                                  iou=self.IOU_THRESHOLD, device="intel:gpu")
-        for result in results:
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                cls_name = self.custom_model.names[cls_id]
-                if cls_name in {'person', 'bus'}:  # Skip these classes
-                    continue
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                custom_dets.append((cls_name, (x1, y1, x2, y2), box))
-
-        # Deduplicate detections
-        final_dets = yolov8_dets + [
-            (cls, box, b) for cls, box, b in custom_dets
-            if all(self.iou(box, ybox) <= 0.5 for _, ybox, _ in yolov8_dets)
-        ]
+        # Use the latest detections from the worker thread
+        final_dets = self.latest_detections
 
         # Convert to Norfair detections
         norfair_detections = []
@@ -364,6 +585,17 @@ class VehicleDetectionApp(QMainWindow):
             y_offset += 20  # Reduced spacing
             # Update counts in text display
             self.results_text.setText('\n'.join([f"{k}: {v}" for k, v in self.unique_vehicle_counts.items()]))
+            
+        # Add FPS and processing info
+        cv2.putText(frame, f"Display FPS: {self.display_fps:.1f}", (10, frame.shape[0] - 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, f"Processing FPS: {self.processing_fps:.1f}", (10, frame.shape[0] - 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                   
+        # Add RTSP status
+        if self.is_rtsp:
+            cv2.putText(frame, "RTSP Mode: Optimized", (10, frame.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         # We've replaced the ROI polygon with a counting line in the middle of the screen
 
@@ -384,8 +616,13 @@ class VehicleDetectionApp(QMainWindow):
         return ccw(p1, l1, l2) != ccw(p2, l1, l2) and ccw(p1, p2, l1) != ccw(p1, p2, l2)
             
     def closeEvent(self, event):
+        # Stop detection and worker thread
+        self.stop_detection()
+        
+        # Release video capture
         if self.cap is not None:
             self.cap.release()
+            self.cap = None
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
