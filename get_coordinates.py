@@ -3,10 +3,11 @@ import numpy as np
 import sys
 import os
 import yaml
+import time
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLabel, QPushButton, QListWidget,
                            QFileDialog, QListWidgetItem, QGroupBox, QMessageBox,
-                           QSplitter)
+                           QSplitter, QTextEdit)
 from PyQt5.QtGui import QImage, QPixmap, QColor, QFont, QPainter, QPen
 from PyQt5.QtCore import Qt, QPoint, QSize
 
@@ -26,6 +27,7 @@ class CoordinateSelector(QMainWindow):
         self.original_frame = None
         self.is_drawing = False
         self.video_path = None
+        self.is_rtsp = False
         self.width = 640
         self.height = 360
         
@@ -66,6 +68,19 @@ class CoordinateSelector(QMainWindow):
         
         self.image_layout.addLayout(button_layout)
         
+        # RTSP section
+        rtsp_layout = QHBoxLayout()
+        self.rtsp_input = QTextEdit()
+        self.rtsp_input.setPlaceholderText("Enter RTSP URL (e.g., rtsp://username:password@ip:port/stream)")
+        self.rtsp_input.setMaximumHeight(50)
+        rtsp_layout.addWidget(self.rtsp_input)
+        
+        self.rtsp_btn = QPushButton("Connect RTSP")
+        self.rtsp_btn.clicked.connect(self.connect_rtsp)
+        rtsp_layout.addWidget(self.rtsp_btn)
+        
+        self.image_layout.addLayout(rtsp_layout)
+        
         # Right panel for displaying points
         self.points_panel = QWidget()
         self.points_layout = QVBoxLayout(self.points_panel)
@@ -86,7 +101,7 @@ class CoordinateSelector(QMainWindow):
         instructions_group = QGroupBox("Instructions")
         instructions_layout = QVBoxLayout(instructions_group)
         instructions = QLabel(
-            "1. Load a video or use the default\n"
+            "1. Load a video, connect to RTSP stream, or use the default\n"
             "2. Click on the image to add points\n"
             "3. Points form a polygon in sequence\n"
             "4. Minimum 3 points required\n"
@@ -114,24 +129,72 @@ class CoordinateSelector(QMainWindow):
         
         if file_path:
             self.video_path = file_path
+            self.is_rtsp = False
             self.load_first_frame()
+            
+    def connect_rtsp(self):
+        """Connect to RTSP stream and get first frame"""
+        rtsp_url = self.rtsp_input.toPlainText().strip()
+        if not rtsp_url:
+            QMessageBox.warning(self, "Warning", "Please enter an RTSP URL!")
+            return
+        
+        # Set the video path to the RTSP URL
+        self.video_path = rtsp_url
+        self.is_rtsp = True
+        
+        QMessageBox.information(self, "RTSP Connection", 
+                               f"Attempting to connect to RTSP stream:\n{rtsp_url}\n\nThis may take a few moments...")
+        
+        self.load_first_frame()
     
     def load_first_frame(self):
-        """Load the first frame from the video file"""
+        """Load the first frame from the video file or RTSP stream"""
         if not self.video_path:
-            QMessageBox.warning(self, "Warning", "No video path selected")
+            QMessageBox.warning(self, "Warning", "No video path or RTSP URL selected")
             return
+        
+        # For RTSP streams, use FFMPEG backend for better compatibility
+        if hasattr(self, 'is_rtsp') and self.is_rtsp:
+            cap = cv2.VideoCapture(self.video_path, cv2.CAP_FFMPEG)
             
-        cap = cv2.VideoCapture(self.video_path)
+            # RTSP-specific optimizations
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Set minimal buffer size
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))  # Set RTSP transport to TCP
+            
+            # Give more time for RTSP connection
+            connect_timeout = 10  # seconds
+            start_time = time.time()
+            connected = False
+            
+            # Try to connect with a timeout
+            while time.time() - start_time < connect_timeout:
+                if cap.isOpened():
+                    connected = True
+                    break
+                time.sleep(0.5)  # Wait a bit before trying again
+                
+            if not connected:
+                QMessageBox.critical(self, "Error", f"Could not connect to RTSP stream after {connect_timeout} seconds")
+                return
+                
+            # Try to grab multiple frames to stabilize the connection
+            for _ in range(5):
+                cap.grab()
+        else:
+            # Regular video file
+            cap = cv2.VideoCapture(self.video_path)
+            
         if not cap.isOpened():
-            QMessageBox.critical(self, "Error", f"Could not open video: {self.video_path}")
+            QMessageBox.critical(self, "Error", f"Could not open video/stream: {self.video_path}")
             return
-            
+        
+        # Read the frame
         ret, frame = cap.read()
         cap.release()
         
-        if not ret:
-            QMessageBox.critical(self, "Error", "Could not read frame from video")
+        if not ret or frame is None:
+            QMessageBox.critical(self, "Error", "Could not read frame from video or stream")
             return
             
         # Resize to our fixed 640x360 resolution
@@ -139,7 +202,11 @@ class CoordinateSelector(QMainWindow):
         self.original_frame = self.frame.copy()
         self.update_display_frame()
         
-        self.setWindowTitle(f"Coordinate Selector - {os.path.basename(self.video_path)}")
+        # Set window title based on source type
+        if hasattr(self, 'is_rtsp') and self.is_rtsp:
+            self.setWindowTitle(f"Coordinate Selector - RTSP Stream")
+        else:
+            self.setWindowTitle(f"Coordinate Selector - {os.path.basename(self.video_path)}")
                 
     def update_display_frame(self):
         """Update the image with grid, points, and polygon"""
@@ -169,6 +236,11 @@ class CoordinateSelector(QMainWindow):
                      (0, 0, 255), 2)
         cv2.putText(self.processed_frame, f"640x360", (10, self.height - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                   
+        # Add source type indicator
+        source_text = "RTSP Stream" if self.is_rtsp else "Video File"
+        cv2.putText(self.processed_frame, source_text, (self.width - 150, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                    
         # Draw polygon if we have points
         if len(self.points) > 0:

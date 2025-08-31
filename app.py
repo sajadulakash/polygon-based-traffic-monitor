@@ -2,6 +2,8 @@ import sys
 import cv2
 import threading
 import queue
+import os
+import csv
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
                            QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog,
                            QComboBox, QSpinBox, QTextEdit)
@@ -37,6 +39,17 @@ class ProcessingWorker(QObject):
         self.PROCESSING_WIDTH = 640
         self.PROCESSING_HEIGHT = 360
         
+        # Frame rate control
+        if not is_rtsp and cap is not None and cap.isOpened():
+            self.original_fps = cap.get(cv2.CAP_PROP_FPS)
+            # If FPS is not available or unreasonable, default to 30 FPS
+            if self.original_fps <= 0 or self.original_fps > 120:
+                self.original_fps = 30.0
+            self.frame_delay = 1.0 / self.original_fps
+        else:
+            self.original_fps = 30.0
+            self.frame_delay = 1.0 / 30.0
+        
     def start(self):
         """Start the worker threads"""
         self.running = True
@@ -59,35 +72,82 @@ class ProcessingWorker(QObject):
             self.process_thread.join(timeout=1.0)
     
     def _capture_loop(self):
-        """Thread that continuously captures frames from the video source"""
+        """Thread that continuously captures frames from the video source at the original video's frame rate"""
+        frame_count = 0
+        end_of_video_reported = False
+        last_frame_time = 0
+        
         while self.running:
+            # Check if video capture is valid
             if self.cap is None or not self.cap.isOpened():
                 time.sleep(0.1)
                 continue
+            
+            # Get the original video's frame rate for regular videos (not RTSP)
+            if not self.is_rtsp and not hasattr(self, 'original_fps'):
+                self.original_fps = self.cap.get(cv2.CAP_PROP_FPS)
+                # If FPS is not available or unreasonable, default to 30 FPS
+                if self.original_fps <= 0 or self.original_fps > 120:
+                    self.original_fps = 30.0
+                self.frame_delay = 1.0 / self.original_fps
+                print(f"Video FPS: {self.original_fps}, frame delay: {self.frame_delay:.4f} seconds")
+            
+            # For non-RTSP videos, control the frame rate to match the original video
+            if not self.is_rtsp:
+                # Calculate time since last frame
+                current_time = time.time()
+                elapsed = current_time - last_frame_time
+                
+                # Sleep to maintain original video frame rate
+                if elapsed < self.frame_delay:
+                    time.sleep(max(0, self.frame_delay - elapsed))
+                
+                # Update last frame time
+                last_frame_time = time.time()
                 
             # For RTSP streams, clear the buffer before reading
             if self.is_rtsp:
                 # Skip frames to get to the most recent one
                 for _ in range(2):  # Skip buffered frames
                     self.cap.grab()
-                    
+            
             # Read the actual frame
             ret, frame = self.cap.read()
             if not ret:
+                # Handle end of video
+                if not end_of_video_reported and not self.is_rtsp:
+                    print("End of video reached or frame read error")
+                    end_of_video_reported = True
+                    
+                    # For regular video files, rewind to start for looping playback
+                    if self.cap is not None:
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        
                 time.sleep(0.1)
                 continue
                 
-            # Resize the frame to our processing resolution
-            frame = cv2.resize(frame, (self.PROCESSING_WIDTH, self.PROCESSING_HEIGHT))
+            # Reset the end of video flag if we successfully read a frame
+            end_of_video_reported = False
+            frame_count += 1
             
-            # Put in queue, dropping old frames if queue is full
+            # Log occasional frame progress
+            if frame_count % 100 == 0:
+                print(f"Processed {frame_count} frames")
+                
             try:
+                # Resize the frame to our processing resolution
+                frame = cv2.resize(frame, (self.PROCESSING_WIDTH, self.PROCESSING_HEIGHT))
+                
+                # Put in queue, dropping old frames if queue is full
                 if self.frame_queue.full():
                     try:
                         self.frame_queue.get_nowait()  # Discard old frame
                     except queue.Empty:
                         pass
                 self.frame_queue.put(frame, block=False)
+            except Exception as e:
+                print(f"Error in capture loop: {str(e)}")
+                time.sleep(0.1)
             except queue.Full:
                 pass  # Skip this frame if queue is still full
     
@@ -118,30 +178,46 @@ class ProcessingWorker(QObject):
         yolov8_dets = []
         custom_dets = []
         
-        # Process with YOLOv8
-        results = self.yolov8_model(frame, conf=self.YOLOV8N_CONFIDENCE, 
-                                  iou=self.IOU_THRESHOLD, device="intel:gpu")
-        for result in results:
-            for box in result.boxes:
-                cls_id = int(box.cls[0])
-                cls_name = self.yolov8_model.names[cls_id]
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                yolov8_dets.append((cls_name, (x1, y1, x2, y2), box))
-
-        # Only run custom model if we have enough time (not for RTSP real-time)
-        # or if we're processing regular video files
-        if not self.is_rtsp:
-            # Custom model detections
-            results = self.custom_model(frame, conf=self.NEW_PT_CONFIDENCE, 
-                                      iou=self.IOU_THRESHOLD, device="intel:gpu")
+        try:
+            # Try with Intel GPU first
+            device = "intel:gpu"
+            try:
+                # Process with YOLOv8
+                results = self.yolov8_model(frame, conf=self.YOLOV8N_CONFIDENCE, 
+                                          iou=self.IOU_THRESHOLD, device=device)
+            except (RuntimeError, Exception) as e:
+                # Fall back to CPU if GPU fails
+                print(f"GPU inference failed, falling back to CPU: {str(e)}")
+                device = "cpu"
+                results = self.yolov8_model(frame, conf=self.YOLOV8N_CONFIDENCE, 
+                                          iou=self.IOU_THRESHOLD, device=device)
+                
             for result in results:
                 for box in result.boxes:
                     cls_id = int(box.cls[0])
-                    cls_name = self.custom_model.names[cls_id]
-                    if cls_name in {'person', 'bus'}:  # Skip these classes
-                        continue
+                    cls_name = self.yolov8_model.names[cls_id]
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    custom_dets.append((cls_name, (x1, y1, x2, y2), box))
+                    yolov8_dets.append((cls_name, (x1, y1, x2, y2), box))
+
+            # Only run custom model if we have enough time (not for RTSP real-time)
+            # or if we're processing regular video files
+            if not self.is_rtsp:
+                # Custom model detections using the same device that worked for YOLOv8
+                results = self.custom_model(frame, conf=self.NEW_PT_CONFIDENCE, 
+                                          iou=self.IOU_THRESHOLD, device=device)
+                for result in results:
+                    for box in result.boxes:
+                        cls_id = int(box.cls[0])
+                        cls_name = self.custom_model.names[cls_id]
+                        if cls_name in {'person', 'bus'}:  # Skip these classes
+                            continue
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        custom_dets.append((cls_name, (x1, y1, x2, y2), box))
+        
+        except Exception as e:
+            print(f"Error in frame processing: {str(e)}")
+            # Return empty detections instead of crashing
+            return {'detections': []}
 
         # Deduplicate detections
         final_dets = yolov8_dets + [
@@ -239,6 +315,14 @@ class VehicleDetectionApp(QMainWindow):
         self.unique_vehicle_counts = defaultdict(int)
         self.track_positions = {}  # Store previous positions of tracked objects
         self.counted_ids = set()   # IDs that have been counted
+        
+        # Object tracking for CSV logging
+        self.object_entry_times = {}  # Track when objects enter the zone {track_id: (timestamp, class_name)}
+        self.object_exit_times = {}   # Track when objects exit the zone {track_id: timestamp}
+        self.logged_objects = set()   # Track IDs that have already been logged to CSV
+        
+        # Initialize CSV logging
+        self.setup_csv_logging()
 
     def load_config(self):
         with open("config2.yaml", "r") as f:
@@ -255,25 +339,75 @@ class VehicleDetectionApp(QMainWindow):
         self.YOLOV8N_CONFIDENCE = 0.4
         self.IOU_THRESHOLD = 0.3
         
-        # Check if we have a counting zone (polygon) or counting line
+        # Load the counting zone (polygon) from the config
         if "counting_zone" in self.config:
             self.counting_zone = self.config["counting_zone"]
-            self.use_counting_zone = True
             print(f"Loaded counting zone from config with {len(self.counting_zone)} points")
-        elif "counting_line" in self.config:
-            self.line_start = self.config["counting_line"]["start"]
-            self.line_end = self.config["counting_line"]["end"]
-            self.use_counting_zone = False
-            print(f"Loaded counting line from config: {self.line_start} to {self.line_end}")
         else:
-            # Default: horizontal line in the middle
-            self.line_start = [0, self.PROCESSING_HEIGHT // 2]
-            self.line_end = [self.PROCESSING_WIDTH, self.PROCESSING_HEIGHT // 2]
-            self.use_counting_zone = False
-            print(f"Using default counting line: {self.line_start} to {self.line_end}")
+            # Default: create a default counting zone in the center of the frame
+            center_x, center_y = self.PROCESSING_WIDTH // 2, self.PROCESSING_HEIGHT // 2
+            offset_x, offset_y = self.PROCESSING_WIDTH // 4, self.PROCESSING_HEIGHT // 4
+            self.counting_zone = [
+                [center_x - offset_x, center_y - offset_y],
+                [center_x + offset_x, center_y - offset_y],
+                [center_x + offset_x, center_y + offset_y],
+                [center_x - offset_x, center_y + offset_y]
+            ]
+            print(f"Using default counting zone with 4 points")
             
         # Initialize variables for zone-based counting
         self.object_in_zone = set()  # Track IDs of objects currently in the counting zone
+        
+    def setup_csv_logging(self):
+        """Set up CSV logging for object detection data"""
+        # Create data directory if it doesn't exist
+        if not os.path.exists('data'):
+            os.makedirs('data')
+            
+        # Generate filename with current date
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        self.csv_filename = os.path.join('data', f'data_{current_date}.csv')
+        
+        # Check if file exists and create with headers if it doesn't
+        file_exists = os.path.isfile(self.csv_filename)
+        
+        if not file_exists:
+            with open(self.csv_filename, 'w', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow(['Object_ID', 'Class_Name', 'Zone_In_Timestamp', 'Zone_Out_Timestamp'])
+                self.results_text.append(f"Created new CSV log file: {self.csv_filename}")
+        else:
+            self.results_text.append(f"Using existing CSV log file: {self.csv_filename}")
+            
+    def log_object_to_csv(self, track_id, class_name, entry_time, exit_time):
+        """Log an object's entry and exit times to the CSV file"""
+        try:
+            with open(self.csv_filename, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                # Format timestamps for better readability
+                entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                csv_writer.writerow([f"{track_id}", f"{class_name}", entry_time_str, exit_time_str])
+                
+            # Add to logged objects set to avoid duplicate logging
+            self.logged_objects.add(track_id)
+            print(f"Logged object ID {track_id} ({class_name}) to CSV")
+        except Exception as e:
+            print(f"Error logging to CSV: {str(e)}")
+            
+    def check_for_completed_tracks(self):
+        """Check for objects that have both entry and exit times and log them"""
+        # Find objects that have both entered and exited the zone
+        completed_objects = []
+        
+        for track_id, (entry_time, class_name) in self.object_entry_times.items():
+            if track_id in self.object_exit_times and track_id not in self.logged_objects:
+                exit_time = self.object_exit_times[track_id]
+                # Only log if the object was in the zone for a reasonable time (to filter false positives)
+                time_in_zone = (exit_time - entry_time).total_seconds()
+                if time_in_zone > 0.1:  # At least 100ms in zone
+                    self.log_object_to_csv(track_id, class_name, entry_time, exit_time)
+                    completed_objects.append(track_id)
 
     def iou(self, box1, box2):
         x1, y1, x2, y2 = box1
@@ -332,11 +466,30 @@ class VehicleDetectionApp(QMainWindow):
         if filename:
             # Stop any existing processing
             self.stop_detection()
+            self.results_text.append(f"Loading video: {filename}...")
             
             # Open the video file
             self.cap = cv2.VideoCapture(filename)
+            
+            # Check if the video was opened successfully
+            if not self.cap.isOpened():
+                self.results_text.append(f"ERROR: Could not open video file: {filename}")
+                self.cap = None
+                return
+                
+            # Try to read the first frame to verify the video is readable
+            ret, test_frame = self.cap.read()
+            if not ret or test_frame is None:
+                self.results_text.append(f"ERROR: Could not read frames from video file: {filename}")
+                self.cap.release()
+                self.cap = None
+                return
+                
+            # Reset position to the beginning
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                
             self.is_rtsp = False  # Reset RTSP flag for video files
-            self.results_text.append(f"Loaded video: {filename}")
+            self.results_text.append(f"Successfully loaded video: {filename}")
     
     def connect_rtsp(self):
         rtsp_url = self.rtsp_input.toPlainText().strip()
@@ -373,23 +526,68 @@ class VehicleDetectionApp(QMainWindow):
         if self.cap is None:
             self.results_text.append("Please load a video or connect to an RTSP stream first!")
             return
+        
+        if not self.cap.isOpened():
+            self.results_text.append("Error: Video source is not open or accessible!")
+            return
             
+        # Check if we can read frames
+        ret, test_frame = self.cap.read()
+        if not ret or test_frame is None:
+            self.results_text.append("Error: Cannot read frames from video source!")
+            return
+            
+        # Reset position to the beginning of the video
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
         # Stop any existing worker
         self.stop_detection()
         
-        # Create and start worker thread
-        self.worker = ProcessingWorker(self.cap, self.yolov8_model, self.custom_model, 
-                                     self.config, is_rtsp=self.is_rtsp)
-        self.worker.result_ready.connect(self.process_result)
-        self.worker.start()
+        # Clear previous results
+        self.latest_frame = None
+        self.latest_detections = []
         
-        # Start the UI update timer - faster for RTSP
-        if self.is_rtsp:
-            self.timer.start(15)  # Update every 15ms for smoother RTSP display
-        else:
-            self.timer.start(30)  # Regular update for video files
+        try:
+            # Get video properties
+            if not self.is_rtsp:
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration_sec = frame_count / fps if fps > 0 else 0
+                minutes = int(duration_sec / 60)
+                seconds = int(duration_sec % 60)
+                
+                self.results_text.append(f"Video info: {fps:.2f} FPS, {frame_count} frames")
+                self.results_text.append(f"Duration: {minutes}m {seconds}s")
+                self.results_text.append(f"Playback will match original speed ({fps:.2f} FPS)")
             
-        self.results_text.append("Detection started in worker thread...")
+            # Create and start worker thread
+            self.results_text.append("Initializing detection...")
+            self.worker = ProcessingWorker(self.cap, self.yolov8_model, self.custom_model, 
+                                         self.config, is_rtsp=self.is_rtsp)
+            self.worker.result_ready.connect(self.process_result)
+            self.worker.start()
+            
+            # Start the UI update timer
+            # For both RTSP and regular videos, update the display at the original video frame rate
+            if self.is_rtsp:
+                self.timer.start(15)  # Update every 15ms for smoother RTSP display
+            else:
+                # For regular videos, get the timer interval based on the video's frame rate
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                if fps <= 0 or fps > 120:
+                    fps = 30.0  # Default to 30 FPS if invalid
+                # Calculate milliseconds per frame for the timer
+                timer_interval = int(1000 / fps)
+                self.timer.start(timer_interval)
+                self.results_text.append(f"Display timer set to {timer_interval}ms per frame")
+                
+            self.results_text.append("Detection started in worker thread...")
+            
+        except Exception as e:
+            self.results_text.append(f"Error starting detection: {str(e)}")
+            if self.worker:
+                self.worker.stop()
+                self.worker = None
 
     def stop_detection(self):
         # Stop timer
@@ -458,46 +656,30 @@ class VehicleDetectionApp(QMainWindow):
             print(f"DEBUG: Using fixed frame size 640x360 for all videos")
             self.debug_printed = True
         
-        if self.use_counting_zone:
-            # With fixed 640x360 frame, no scaling is needed for the counting zone
-            scaled_polygon = []
-            for point in self.counting_zone:
-                # No scaling needed since we're at fixed resolution
-                x = int(point[0]) 
-                y = int(point[1])
-                scaled_polygon.append((x, y))
+        # With fixed 640x360 frame, no scaling is needed for the counting zone
+        scaled_polygon = []
+        for point in self.counting_zone:
+            # No scaling needed since we're at fixed resolution
+            x = int(point[0]) 
+            y = int(point[1])
+            scaled_polygon.append((x, y))
+        
+        # Draw the polygon
+        if len(scaled_polygon) >= 3:
+            polygon_array = np.array(scaled_polygon, np.int32)
+            polygon_array = polygon_array.reshape((-1, 1, 2))
+            cv2.polylines(frame, [polygon_array], isClosed=True, color=(0, 255, 255), thickness=2)
             
-            # Draw the polygon
-            if len(scaled_polygon) >= 3:
-                polygon_array = np.array(scaled_polygon, np.int32)
-                polygon_array = polygon_array.reshape((-1, 1, 2))
-                cv2.polylines(frame, [polygon_array], isClosed=True, color=(0, 255, 255), thickness=2)
-                
-                # Fill with transparent color
-                overlay = frame.copy()
-                cv2.fillPoly(overlay, [polygon_array], color=(0, 255, 0))
-                cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)  # 20% opacity
-                
-                # Add label
-                centroid_x = sum(p[0] for p in scaled_polygon) // len(scaled_polygon)
-                centroid_y = sum(p[1] for p in scaled_polygon) // len(scaled_polygon)
-                cv2.putText(frame, "Counting Zone", (centroid_x - 40, centroid_y), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        else:
-            # Draw traditional counting line - no scaling needed with fixed frame size
-            start_x = int(self.line_start[0]) 
-            start_y = int(self.line_start[1])
-            end_x = int(self.line_end[0])
-            end_y = int(self.line_end[1])
+            # Fill with transparent color
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [polygon_array], color=(0, 255, 0))
+            cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)  # 20% opacity
             
-            # Make the line with reduced thickness
-            cv2.line(frame, (start_x, start_y), (end_x, end_y), (0, 0, 255), 2)  # Reduced thickness
-            # Add smaller circle endpoints
-            cv2.circle(frame, (start_x, start_y), 3, (255, 0, 0), -1)  # Blue start point, smaller
-            cv2.circle(frame, (end_x, end_y), 3, (0, 255, 0), -1)      # Green end point, smaller
-            # Add smaller label
-            cv2.putText(frame, "Counting Line", (start_x + 10, start_y - 10), 
-                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            # Add label
+            centroid_x = sum(p[0] for p in scaled_polygon) // len(scaled_polygon)
+            centroid_y = sum(p[1] for p in scaled_polygon) // len(scaled_polygon)
+            cv2.putText(frame, "Counting Zone", (centroid_x - 40, centroid_y), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         # Draw tracked objects and count
         for track in tracked_objects:
@@ -536,43 +718,50 @@ class VehicleDetectionApp(QMainWindow):
             # Get current position of the object
             current_position = (center_x, center_y)
             
-            if self.use_counting_zone:
-                # For polygon-based counting
-                # Scale the counting zone to match the original frame size
-                scaled_polygon = []
-                for point in self.counting_zone:
-                    x = int(point[0] * width_scale_factor)
-                    y = int(point[1] * height_scale_factor)
-                    scaled_polygon.append((x, y))
-                
-                # Check if the object is inside the polygon
-                is_in_zone = self.point_in_polygon(current_position, scaled_polygon)
-                
-                # Count the object if it wasn't previously in the zone but is now
-                if is_in_zone:
-                    if track_id not in self.object_in_zone:
-                        self.object_in_zone.add(track_id)
-                        # Only count if not already counted
-                        if track_id not in self.counted_ids:
-                            self.unique_vehicle_counts[cls_name] += 1
-                            self.counted_ids.add(track_id)
-                            # Highlight the object when counted
-                            cv2.rectangle(frame, (x1o, y1o), (x2o, y2o), (0, 0, 255), 2)
-                else:
-                    # Object left the zone
-                    if track_id in self.object_in_zone:
-                        self.object_in_zone.remove(track_id)
-            else:
-                # Traditional line crossing detection
-                if track_id in self.track_positions:
-                    previous_position = self.track_positions[track_id]
-                    # Check if object crossed the line
-                    if self.line_crossed(previous_position, current_position, 
-                                        (start_x, start_y), (end_x, end_y)) and track_id not in self.counted_ids:
+            # For polygon-based counting
+            # Scale the counting zone to match the original frame size
+            scaled_polygon = []
+            for point in self.counting_zone:
+                x = int(point[0] * width_scale_factor)
+                y = int(point[1] * height_scale_factor)
+                scaled_polygon.append((x, y))
+            
+            # Check if the object is inside the polygon
+            is_in_zone = self.point_in_polygon(current_position, scaled_polygon)
+            
+            # Check if the object is entering or leaving the zone
+            if is_in_zone:
+                if track_id not in self.object_in_zone:
+                    # Object is entering the zone
+                    self.object_in_zone.add(track_id)
+                    current_time = datetime.now()
+                    # Store entry time and class
+                    self.object_entry_times[track_id] = (current_time, cls_name)
+                    
+                    # Only count if not already counted
+                    if track_id not in self.counted_ids:
                         self.unique_vehicle_counts[cls_name] += 1
                         self.counted_ids.add(track_id)
                         # Highlight the object when counted
                         cv2.rectangle(frame, (x1o, y1o), (x2o, y2o), (0, 0, 255), 2)
+                        
+                        # Display the entry time
+                        time_str = current_time.strftime('%H:%M:%S')
+                        cv2.putText(frame, f"IN: {time_str}", (x1o, y1o - 20),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            else:
+                # Object left the zone
+                if track_id in self.object_in_zone:
+                    self.object_in_zone.remove(track_id)
+                    current_time = datetime.now()
+                    # Store exit time
+                    self.object_exit_times[track_id] = current_time
+                    
+                    # Display the exit time
+                    if track_id in self.object_entry_times:
+                        time_str = current_time.strftime('%H:%M:%S')
+                        cv2.putText(frame, f"OUT: {time_str}", (x1o, y1o - 5),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
             
             # Update position history
             self.track_positions[track_id] = current_position
@@ -587,18 +776,36 @@ class VehicleDetectionApp(QMainWindow):
             self.results_text.setText('\n'.join([f"{k}: {v}" for k, v in self.unique_vehicle_counts.items()]))
             
         # Add FPS and processing info
-        cv2.putText(frame, f"Display FPS: {self.display_fps:.1f}", (10, frame.shape[0] - 50),
+        cv2.putText(frame, f"Display FPS: {self.display_fps:.1f}", (10, frame.shape[0] - 70),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(frame, f"Processing FPS: {self.processing_fps:.1f}", (10, frame.shape[0] - 30),
+        cv2.putText(frame, f"Processing FPS: {self.processing_fps:.1f}", (10, frame.shape[0] - 50),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Display original video frame rate
+        if hasattr(self.worker, 'original_fps'):
+            cv2.putText(frame, f"Original Video FPS: {self.worker.original_fps:.1f}", 
+                       (10, frame.shape[0] - 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                    
-        # Add RTSP status
+        # Add playback mode status
         if self.is_rtsp:
             cv2.putText(frame, "RTSP Mode: Optimized", (10, frame.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        else:
+            cv2.putText(frame, "Playback Mode: Real-time speed", (10, frame.shape[0] - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         # We've replaced the ROI polygon with a counting line in the middle of the screen
 
+        # Check for objects that have completed their tracking cycle and log them
+        self.check_for_completed_tracks()
+        
+        # Display CSV logging status
+        if hasattr(self, 'csv_filename'):
+            filename = os.path.basename(self.csv_filename)
+            cv2.putText(frame, f"Logging to: {filename}", (10, 20),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
         # No need to resize again since we're already at our target resolution (640x360)
         # Just convert to RGB for display
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -607,15 +814,26 @@ class VehicleDetectionApp(QMainWindow):
         qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(qt_image))
 
-    def line_crossed(self, p1, p2, l1, l2):
-        """Check if line segment p1-p2 crosses line segment l1-l2"""
-        def ccw(a, b, c):
-            return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
-        
-        # Check if line segments intersect
-        return ccw(p1, l1, l2) != ccw(p2, l1, l2) and ccw(p1, p2, l1) != ccw(p1, p2, l2)
-            
+    # Removed line_crossed method as we're only using polygon-based counting
     def closeEvent(self, event):
+        # Final check for any objects that need to be logged
+        current_time = datetime.now()
+        
+        # For objects that entered but never exited, log them with current time as exit time
+        for track_id, (entry_time, class_name) in list(self.object_entry_times.items()):
+            if track_id not in self.object_exit_times and track_id not in self.logged_objects:
+                self.object_exit_times[track_id] = current_time
+                self.log_object_to_csv(track_id, class_name, entry_time, current_time)
+        
+        # Check for any remaining completed tracks
+        self.check_for_completed_tracks()
+        
+        # Log the total counts to the results
+        self.results_text.append("\nFinal vehicle counts:")
+        for cls_name, count in self.unique_vehicle_counts.items():
+            self.results_text.append(f"{cls_name}: {count}")
+        self.results_text.append(f"\nDetection data logged to {self.csv_filename}")
+        
         # Stop detection and worker thread
         self.stop_detection()
         
