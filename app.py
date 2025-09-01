@@ -321,6 +321,14 @@ class VehicleDetectionApp(QMainWindow):
         self.object_exit_times = {}   # Track when objects exit the zone {track_id: timestamp}
         self.logged_objects = set()   # Track IDs that have already been logged to CSV
         
+        # Custom ID system
+        self.session_id = datetime.now().strftime("%Y%m%d")
+        self.custom_id_counter = defaultdict(int)  # Counter per class type
+        self.track_id_to_custom = {}  # Maps Norfair track.id to our custom ID format
+        
+        # Try to load previous counter state if available
+        self.load_counter_state()
+        
         # Initialize CSV logging
         self.setup_csv_logging()
 
@@ -358,6 +366,58 @@ class VehicleDetectionApp(QMainWindow):
         # Initialize variables for zone-based counting
         self.object_in_zone = set()  # Track IDs of objects currently in the counting zone
         
+    def get_custom_id(self, track_id, cls_name):
+        """Generate or retrieve a custom ID for a track"""
+        if track_id in self.track_id_to_custom:
+            return self.track_id_to_custom[track_id]
+            
+        # Create new custom ID
+        self.custom_id_counter[cls_name] += 1
+        custom_id = f"{cls_name}-{self.session_id}-{self.custom_id_counter[cls_name]:06d}"
+        
+        # Store mapping
+        self.track_id_to_custom[track_id] = custom_id
+        print(f"Assigned custom ID {custom_id} to track {track_id}")
+        
+        # Save updated counter state
+        self.save_counter_state()
+        
+        return custom_id
+        
+    def save_counter_state(self):
+        """Save counter state to disk for persistence across sessions"""
+        try:
+            # Create data directory if it doesn't exist
+            if not os.path.exists('data'):
+                os.makedirs('data')
+                
+            state_file = os.path.join('data', 'counter_state.yaml')
+            state_data = {
+                'session_id': self.session_id,
+                'counters': dict(self.custom_id_counter)
+            }
+            
+            with open(state_file, 'w') as f:
+                yaml.dump(state_data, f)
+        except Exception as e:
+            print(f"Error saving counter state: {str(e)}")
+    
+    def load_counter_state(self):
+        """Load counter state from disk if available"""
+        try:
+            state_file = os.path.join('data', 'counter_state.yaml')
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    state_data = yaml.safe_load(f)
+                
+                # If it's the same day, use the saved counters
+                if state_data.get('session_id') == self.session_id:
+                    for cls_name, count in state_data.get('counters', {}).items():
+                        self.custom_id_counter[cls_name] = count
+                    print(f"Loaded previous counter state for session {self.session_id}")
+        except Exception as e:
+            print(f"Error loading counter state: {str(e)}")
+    
     def setup_csv_logging(self):
         """Set up CSV logging for object detection data"""
         # Create data directory if it doesn't exist
@@ -382,16 +442,19 @@ class VehicleDetectionApp(QMainWindow):
     def log_object_to_csv(self, track_id, class_name, entry_time, exit_time):
         """Log an object's entry and exit times to the CSV file"""
         try:
+            # Get or create custom ID for this track
+            custom_id = self.get_custom_id(track_id, class_name)
+            
             with open(self.csv_filename, 'a', newline='') as csvfile:
                 csv_writer = csv.writer(csvfile)
                 # Format timestamps for better readability
                 entry_time_str = entry_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                 exit_time_str = exit_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                csv_writer.writerow([f"{track_id}", f"{class_name}", entry_time_str, exit_time_str])
+                csv_writer.writerow([custom_id, class_name, entry_time_str, exit_time_str])
                 
             # Add to logged objects set to avoid duplicate logging
             self.logged_objects.add(track_id)
-            print(f"Logged object ID {track_id} ({class_name}) to CSV")
+            print(f"Logged object with custom ID {custom_id} ({class_name}) to CSV")
         except Exception as e:
             print(f"Error logging to CSV: {str(e)}")
             
@@ -709,10 +772,14 @@ class VehicleDetectionApp(QMainWindow):
             # Draw center point
             cv2.circle(frame, (center_x, center_y), 3, (0, 0, 255), -1)
 
+            # Get or create custom ID for this track
+            custom_id = self.get_custom_id(track_id, cls_name)
+            
             # Draw bounding box
             color = (0, 255, 0)  # Green
             cv2.rectangle(frame, (x1o, y1o), (x2o, y2o), color, 1)
-            cv2.putText(frame, f"{cls_name} ID:{track_id}", (x1o, y1o-5),
+            # Display the custom ID instead of the track ID
+            cv2.putText(frame, f"{cls_name} ID:{custom_id}", (x1o, y1o-5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
             # Get current position of the object
@@ -728,6 +795,9 @@ class VehicleDetectionApp(QMainWindow):
             
             # Check if the object is inside the polygon
             is_in_zone = self.point_in_polygon(current_position, scaled_polygon)
+            
+            # Get or ensure we have a custom ID for this track
+            custom_id = self.get_custom_id(track_id, cls_name)
             
             # Check if the object is entering or leaving the zone
             if is_in_zone:
@@ -745,9 +815,10 @@ class VehicleDetectionApp(QMainWindow):
                         # Highlight the object when counted
                         cv2.rectangle(frame, (x1o, y1o), (x2o, y2o), (0, 0, 255), 2)
                         
-                        # Display the entry time
+                        # Display the entry time and custom ID
                         time_str = current_time.strftime('%H:%M:%S')
-                        cv2.putText(frame, f"IN: {time_str}", (x1o, y1o - 20),
+                        short_id = custom_id.split('-')[-1]  # Just show the numerical part for cleaner display
+                        cv2.putText(frame, f"IN: {time_str} ({short_id})", (x1o, y1o - 20),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             else:
                 # Object left the zone
@@ -757,10 +828,11 @@ class VehicleDetectionApp(QMainWindow):
                     # Store exit time
                     self.object_exit_times[track_id] = current_time
                     
-                    # Display the exit time
+                    # Display the exit time and custom ID
                     if track_id in self.object_entry_times:
                         time_str = current_time.strftime('%H:%M:%S')
-                        cv2.putText(frame, f"OUT: {time_str}", (x1o, y1o - 5),
+                        short_id = custom_id.split('-')[-1]  # Just show the numerical part
+                        cv2.putText(frame, f"OUT: {time_str} ({short_id})", (x1o, y1o - 5),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
             
             # Update position history
@@ -805,6 +877,12 @@ class VehicleDetectionApp(QMainWindow):
             filename = os.path.basename(self.csv_filename)
             cv2.putText(frame, f"Logging to: {filename}", (10, 20),
                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+        # Display custom ID tracking info
+        if hasattr(self, 'custom_id_counter') and self.custom_id_counter:
+            total_ids = sum(self.custom_id_counter.values())
+            cv2.putText(frame, f"Tracking with custom IDs: {total_ids} objects", (10, 40),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         # No need to resize again since we're already at our target resolution (640x360)
         # Just convert to RGB for display
@@ -833,6 +911,10 @@ class VehicleDetectionApp(QMainWindow):
         for cls_name, count in self.unique_vehicle_counts.items():
             self.results_text.append(f"{cls_name}: {count}")
         self.results_text.append(f"\nDetection data logged to {self.csv_filename}")
+        
+        # Save final counter state
+        self.save_counter_state()
+        self.results_text.append(f"Custom ID counters saved")
         
         # Stop detection and worker thread
         self.stop_detection()
