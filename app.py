@@ -1,3 +1,22 @@
+# GitHub Repository: https://github.com/sajadulakash/polygon-based-traffic-monitor
+# 
+# Polygon-based Traffic Monitor
+# ===========================
+# This application provides a traffic monitoring system that uses polygon-based counting zones
+# to track and count vehicles and other objects passing through predefined areas.
+# The system supports video files and RTSP streams, and includes tools for defining custom counting zones.
+#
+# Features:
+# - Object detection using YOLOv8 and custom models with OpenVINO acceleration
+# - Real-time tracking and counting of objects within user-defined polygon zones
+# - CSV logging of object entry/exit times with custom ID system
+# - RTSP stream support for live monitoring
+# - Integrated coordinate selection tool for easy zone definition
+# 
+# Author: sajadulakash
+# License: MIT
+# Version: 1.0
+
 import sys
 import cv2
 import threading
@@ -244,7 +263,7 @@ class ProcessingWorker(QObject):
 class VehicleDetectionApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Vehicle Detection System")
+        self.setWindowTitle("BrainCount")
         self.setGeometry(100, 100, 1280, 800)  # Slightly wider to accommodate controls
 
         # Create main widget and layout
@@ -287,6 +306,12 @@ class VehicleDetectionApp(QMainWindow):
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self.stop_detection)
         control_layout.addWidget(self.stop_btn)
+        
+        # Add button to launch get_coordinates.py
+        self.coords_btn = QPushButton("Define Counting Zone")
+        self.coords_btn.clicked.connect(self.launch_coordinate_selector)
+        self.coords_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        control_layout.addWidget(self.coords_btn)
 
         # Results display
         self.results_text = QTextEdit()
@@ -893,6 +918,59 @@ class VehicleDetectionApp(QMainWindow):
         self.video_label.setPixmap(QPixmap.fromImage(qt_image))
 
     # Removed line_crossed method as we're only using polygon-based counting
+    
+    def launch_coordinate_selector(self):
+        """Launch the get_coordinates.py script as a separate process"""
+        try:
+            # Create a notification that the app has been launched
+            self.results_text.append("Launching Coordinate Selector tool...")
+            
+            # Use subprocess to run the get_coordinates.py script
+            import subprocess
+            
+            # Run the script using the current Python interpreter
+            python_executable = sys.executable
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "get_coordinates.py")
+            
+            # Run the process detached from this one
+            if os.name == 'nt':  # Windows
+                subprocess.Popen([python_executable, script_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:  # Linux/Mac
+                subprocess.Popen([python_executable, script_path], start_new_session=True)
+            
+            self.results_text.append("Coordinate Selector launched in a new window.")
+            self.results_text.append("After saving coordinates, restart this application or click 'Reload Config' to apply changes.")
+            
+            # Add reload config button if it doesn't exist yet
+            if not hasattr(self, 'reload_config_btn'):
+                self.reload_config_btn = QPushButton("Reload Config")
+                self.reload_config_btn.clicked.connect(self.reload_config)
+                self.reload_config_btn.setStyleSheet("background-color: #2196F3; color: white;")
+                # Find where the coords_btn is in the layout and insert after it
+                layout = self.coords_btn.parent().layout()
+                layout.insertWidget(layout.indexOf(self.coords_btn) + 1, self.reload_config_btn)
+                
+        except Exception as e:
+            self.results_text.append(f"Error launching Coordinate Selector: {str(e)}")
+    
+    def reload_config(self):
+        """Reload the configuration file to apply any changes made by the coordinate selector"""
+        try:
+            # Load the config file
+            with open("config2.yaml", "r") as f:
+                self.config = yaml.safe_load(f)
+                
+            # Update counting zone if it exists in the config
+            if "counting_zone" in self.config:
+                self.counting_zone = self.config["counting_zone"]
+                self.results_text.append(f"Successfully updated counting zone with {len(self.counting_zone)} points")
+            
+            # Notify the user
+            self.results_text.append("Configuration reloaded successfully!")
+            
+        except Exception as e:
+            self.results_text.append(f"Error reloading configuration: {str(e)}")
+    
     def closeEvent(self, event):
         # Final check for any objects that need to be logged
         current_time = datetime.now()

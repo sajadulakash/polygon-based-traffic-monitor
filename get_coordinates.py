@@ -1,3 +1,15 @@
+# GitHub Repository: https://github.com/sajadulakash/polygon-based-traffic-monitor
+# 
+# Coordinate Selector Tool
+# =======================
+# This utility allows users to define polygon counting zones for the traffic monitoring system.
+# It supports both video files and RTSP streams, and provides an interactive interface for
+# selecting coordinates and saving them to the configuration file.
+#
+# Author: sajadulakash
+# License: MIT
+# Version: 1.0
+
 import cv2
 import numpy as np
 import sys
