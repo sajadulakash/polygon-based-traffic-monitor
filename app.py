@@ -25,7 +25,7 @@ import os
 import csv
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
                            QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog,
-                           QComboBox, QSpinBox, QTextEdit)
+                           QComboBox, QSpinBox, QTextEdit, QSizePolicy)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap
 from ultralytics import YOLO
@@ -42,18 +42,16 @@ class ProcessingWorker(QObject):
     # Signal to send processed results back to the main thread
     result_ready = pyqtSignal(dict)
     
-    def __init__(self, cap, yolov8_model, custom_model, config, is_rtsp=False):
+    def __init__(self, cap, yolov8_model, config, is_rtsp=False):
         super().__init__()
         self.cap = cap
         self.yolov8_model = yolov8_model
-        self.custom_model = custom_model
         self.config = config
         self.is_rtsp = is_rtsp
         self.running = False
         self.frame_queue = queue.Queue(maxsize=1)  # Only keep the latest frame
         self.result_queue = queue.Queue(maxsize=2)  # Keep limited results
         self.YOLOV8N_CONFIDENCE = 0.4
-        self.NEW_PT_CONFIDENCE = 0.2
         self.IOU_THRESHOLD = 0.3
         self.PROCESSING_WIDTH = 640
         self.PROCESSING_HEIGHT = 360
@@ -193,9 +191,8 @@ class ProcessingWorker(QObject):
                 continue
     
     def _process_frame(self, frame):
-        """Process a single frame with both models"""
-        yolov8_dets = []
-        custom_dets = []
+        """Process a single frame with the YOLOv8 model"""
+        detections = []
         
         try:
             # Try with Intel GPU first
@@ -215,37 +212,17 @@ class ProcessingWorker(QObject):
                 for box in result.boxes:
                     cls_id = int(box.cls[0])
                     cls_name = self.yolov8_model.names[cls_id]
+                    # Include all detected classes
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    yolov8_dets.append((cls_name, (x1, y1, x2, y2), box))
-
-            # Only run custom model if we have enough time (not for RTSP real-time)
-            # or if we're processing regular video files
-            if not self.is_rtsp:
-                # Custom model detections using the same device that worked for YOLOv8
-                results = self.custom_model(frame, conf=self.NEW_PT_CONFIDENCE, 
-                                          iou=self.IOU_THRESHOLD, device=device)
-                for result in results:
-                    for box in result.boxes:
-                        cls_id = int(box.cls[0])
-                        cls_name = self.custom_model.names[cls_id]
-                        if cls_name in {'person', 'bus'}:  # Skip these classes
-                            continue
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        custom_dets.append((cls_name, (x1, y1, x2, y2), box))
+                    detections.append((cls_name, (x1, y1, x2, y2), box))
         
         except Exception as e:
             print(f"Error in frame processing: {str(e)}")
             # Return empty detections instead of crashing
             return {'detections': []}
-
-        # Deduplicate detections
-        final_dets = yolov8_dets + [
-            (cls, box, b) for cls, box, b in custom_dets
-            if all(self.iou(box, ybox) <= 0.5 for _, ybox, _ in yolov8_dets)
-        ]
         
         return {
-            'detections': final_dets
+            'detections': detections
         }
         
     def iou(self, box1, box2):
@@ -264,34 +241,120 @@ class VehicleDetectionApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BrainCount")
-        self.setGeometry(100, 100, 1280, 800)  # Slightly wider to accommodate controls
+        self.setGeometry(50, 50, 1600, 900)  # Larger window size for better video viewing
 
         # Create main widget and layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        layout = QHBoxLayout(main_widget)
-
-        # Video display area with fixed size matching our processing resolution
+        main_layout = QHBoxLayout(main_widget)
+        
+        # Left sidebar with logo and counts
+        sidebar = QWidget()
+        sidebar.setFixedWidth(400)  # Reduced width for the sidebar
+        sidebar.setStyleSheet("background-color: #2c3e50;")  # Dark blue background
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        
+        # Add BrainCount logo at the top of sidebar
+        logo_label = QLabel()
+        logo_label.setAlignment(Qt.AlignCenter)
+        
+        try:
+            # Load the BrainCount logo from file
+            logo_path = "braincount-logo.png"
+            if os.path.exists(logo_path):
+                logo_pixmap = QPixmap(logo_path)
+                logo_pixmap = logo_pixmap.scaled(200, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                logo_label.setPixmap(logo_pixmap)
+            else:
+                logo_label.setText("BRAINCOUNT")
+                logo_label.setStyleSheet("color: white; font-size: 24px; font-weight: bold;")
+        except Exception as e:
+            print(f"Error loading logo: {e}")
+            logo_label.setText("BRAINCOUNT")
+            logo_label.setStyleSheet("color: white; font-size: 24px; font-weight: bold;")
+        
+        sidebar_layout.addWidget(logo_label)
+        sidebar_layout.addSpacing(20)
+        
+        # Add Class and Count headers
+        headers_widget = QWidget()
+        headers_layout = QHBoxLayout(headers_widget)
+        headers_layout.setContentsMargins(10, 0, 10, 0)
+        
+        class_label = QLabel("Class")
+        class_label.setStyleSheet("color: white; font-weight: bold; font-size: 30px;")
+        count_label = QLabel("Count")
+        count_label.setStyleSheet("color: white; font-weight: bold; font-size: 30px;")
+        
+        headers_layout.addWidget(class_label)
+        headers_layout.addStretch()
+        headers_layout.addWidget(count_label)
+        
+        sidebar_layout.addWidget(headers_widget)
+        
+        # Results display for the sidebar
+        self.sidebar_counts = QTextEdit()
+        self.sidebar_counts.setReadOnly(True)
+        self.sidebar_counts.setStyleSheet("background-color: #34495e; color: white; border: none; font-size: 26px;")
+        sidebar_layout.addWidget(self.sidebar_counts)
+        
+        # Add the sidebar to the main layout
+        main_layout.addWidget(sidebar)
+        
+        # Right side with video and controls
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.setSpacing(5)
+        main_layout.addWidget(right_panel, 4)  # Give the right panel much more space (ratio 4:1)
+        
+        # Video display area that scales with the window
         self.video_label = QLabel()
-        self.video_label.setMinimumSize(640, 360)
-        self.video_label.setMaximumSize(640, 360)
-        layout.addWidget(self.video_label)
-
-        # Control panel
+        self.video_label.setMinimumSize(800, 450)  # Larger minimum size
+        # No maximum size to allow scaling
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # Allow expanding
+        self.video_label.setAlignment(Qt.AlignCenter)  # Center the video
+        right_layout.addWidget(self.video_label, 4)  # Video gets 80% of vertical space
+        
+        # Control panel below video
         control_panel = QWidget()
         control_layout = QVBoxLayout(control_panel)
-        layout.addWidget(control_panel)
+        control_layout.setContentsMargins(2, 2, 2, 2)
+        control_layout.setSpacing(2)
+        right_layout.addWidget(control_panel, 1)  # Controls get 20% of vertical space
 
-        # Add controls
+        # Create a more compact control layout with buttons in rows
+        # Top row of buttons
+        top_button_row = QHBoxLayout()
+        
+        # Load Video button
         self.load_video_btn = QPushButton("Load Video")
         self.load_video_btn.clicked.connect(self.load_video)
-        control_layout.addWidget(self.load_video_btn)
+        top_button_row.addWidget(self.load_video_btn)
         
-        # RTSP Link section
+        # Start and Stop buttons
+        self.start_btn = QPushButton("Start Detection")
+        self.start_btn.clicked.connect(self.start_detection)
+        top_button_row.addWidget(self.start_btn)
+        
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.stop_detection)
+        top_button_row.addWidget(self.stop_btn)
+        
+        # Add button to launch get_coordinates.py
+        self.coords_btn = QPushButton("Define Counting Zone")
+        self.coords_btn.clicked.connect(self.launch_coordinate_selector)
+        self.coords_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        top_button_row.addWidget(self.coords_btn)
+        
+        control_layout.addLayout(top_button_row)
+        
+        # RTSP Link section in a second row
         rtsp_layout = QHBoxLayout()
         self.rtsp_input = QTextEdit()
         self.rtsp_input.setPlaceholderText("Enter RTSP URL (e.g., rtsp://username:password@ip:port/stream)")
-        self.rtsp_input.setMaximumHeight(50)
+        self.rtsp_input.setMaximumHeight(30)  # Reduced height
         rtsp_layout.addWidget(self.rtsp_input)
         
         self.rtsp_btn = QPushButton("Connect RTSP")
@@ -299,23 +362,11 @@ class VehicleDetectionApp(QMainWindow):
         rtsp_layout.addWidget(self.rtsp_btn)
         control_layout.addLayout(rtsp_layout)
 
-        self.start_btn = QPushButton("Start Detection")
-        self.start_btn.clicked.connect(self.start_detection)
-        control_layout.addWidget(self.start_btn)
-
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.stop_detection)
-        control_layout.addWidget(self.stop_btn)
-        
-        # Add button to launch get_coordinates.py
-        self.coords_btn = QPushButton("Define Counting Zone")
-        self.coords_btn.clicked.connect(self.launch_coordinate_selector)
-        self.coords_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        control_layout.addWidget(self.coords_btn)
-
-        # Results display
+        # Results display for log messages - more compact
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
+        self.results_text.setMaximumHeight(70)  # Limit height to make it more compact
+        self.results_text.setStyleSheet("font-size: 9pt;")  # Smaller font
         control_layout.addWidget(self.results_text)
 
         # Initialize variables
@@ -356,6 +407,15 @@ class VehicleDetectionApp(QMainWindow):
         
         # Initialize CSV logging
         self.setup_csv_logging()
+        
+        # Initialize the sidebar counts display with an empty table
+        html_content = "<html><body style='color:white;'><table style='width:100%;'>"
+        for cls, count in self.unique_vehicle_counts.items():
+            # Add spaces to create alignment, minimum 20 chars width, right-aligned
+            padded_class = f"{cls}{' ' * 30}"  # Add plenty of spaces after class name
+            html_content += f"<tr><td style='padding:5px; white-space: pre;'>{padded_class}</td><td style='padding:5px;'>{count}</td></tr>"
+        html_content += "</table></body></html>"
+        self.sidebar_counts.setHtml(html_content)
 
     def load_config(self):
         with open("config2.yaml", "r") as f:
@@ -368,7 +428,6 @@ class VehicleDetectionApp(QMainWindow):
         # Use the same dimensions for output to maintain consistency
         self.OUTPUT_WIDTH = 640
         self.OUTPUT_HEIGHT = 360
-        self.NEW_PT_CONFIDENCE = 0.2
         self.YOLOV8N_CONFIDENCE = 0.4
         self.IOU_THRESHOLD = 0.3
         
@@ -538,10 +597,9 @@ class VehicleDetectionApp(QMainWindow):
         return inside
 
     def load_models(self):
-        self.results_text.append("Loading models...")
+        self.results_text.append("Loading model...")
         self.yolov8_model = YOLO("yolov8s_openvino_model/")
-        self.custom_model = YOLO("v5_pretrained_openvino_model/")
-        self.results_text.append("Models loaded successfully!")
+        self.results_text.append("Model loaded successfully!")
 
     def setup_tracker(self):
         def euclidean_distance(detection, tracked_obj):
@@ -612,7 +670,7 @@ class VehicleDetectionApp(QMainWindow):
             
     def start_detection(self):
         if self.cap is None:
-            self.results_text.append("Please load a video or connect to an RTSP stream first!")
+            # self.results_text.append("Please load a video or connect to an RTSP stream first!")
             return
         
         if not self.cap.isOpened():
@@ -650,7 +708,7 @@ class VehicleDetectionApp(QMainWindow):
             
             # Create and start worker thread
             self.results_text.append("Initializing detection...")
-            self.worker = ProcessingWorker(self.cap, self.yolov8_model, self.custom_model, 
+            self.worker = ProcessingWorker(self.cap, self.yolov8_model, 
                                          self.config, is_rtsp=self.is_rtsp)
             self.worker.result_ready.connect(self.process_result)
             self.worker.start()
@@ -863,15 +921,23 @@ class VehicleDetectionApp(QMainWindow):
             # Update position history
             self.track_positions[track_id] = current_position
 
-        # Display counts on frame
+        """# Display counts on frame
         y_offset = 25  # Reduced starting offset
         for cls, count in self.unique_vehicle_counts.items():
             cv2.putText(frame, f"{cls}: {count}", (10, y_offset),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)  # Smaller font and thinner text
-            y_offset += 20  # Reduced spacing
-            # Update counts in text display
-            self.results_text.setText('\n'.join([f"{k}: {v}" for k, v in self.unique_vehicle_counts.items()]))
+            y_offset += 20  # Reduced spacing """
             
+        # Update counts in sidebar with HTML table for two-column display
+        html_content = "<html><body style='color:white;'><table style='width:100%;'>"
+        for cls, count in self.unique_vehicle_counts.items():
+            # Add spaces to create alignment, minimum 20 chars width, right-aligned
+            padded_class = f"{cls}{' ' * 24}"  # Add plenty of spaces after class name
+            html_content += f"<tr><td style='padding:5px; white-space: pre;'>{padded_class}</td><td style='padding:5px;'>{count}</td></tr>"
+        html_content += "</table></body></html>"
+        self.sidebar_counts.setHtml(html_content)
+            
+        """
         # Add FPS and processing info
         cv2.putText(frame, f"Display FPS: {self.display_fps:.1f}", (10, frame.shape[0] - 70),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
@@ -883,6 +949,7 @@ class VehicleDetectionApp(QMainWindow):
             cv2.putText(frame, f"Original Video FPS: {self.worker.original_fps:.1f}", 
                        (10, frame.shape[0] - 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
                    
         # Add playback mode status
         if self.is_rtsp:
@@ -893,10 +960,11 @@ class VehicleDetectionApp(QMainWindow):
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         # We've replaced the ROI polygon with a counting line in the middle of the screen
-
+        """
         # Check for objects that have completed their tracking cycle and log them
         self.check_for_completed_tracks()
         
+        """
         # Display CSV logging status
         if hasattr(self, 'csv_filename'):
             filename = os.path.basename(self.csv_filename)
@@ -908,14 +976,25 @@ class VehicleDetectionApp(QMainWindow):
             total_ids = sum(self.custom_id_counter.values())
             cv2.putText(frame, f"Tracking with custom IDs: {total_ids} objects", (10, 40),
                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        """
         
-        # No need to resize again since we're already at our target resolution (640x360)
-        # Just convert to RGB for display
+        
+        # Convert to RGB for display
         rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
         qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+        
+        # Create pixmap from the image
+        pixmap = QPixmap.fromImage(qt_image)
+        
+        # Scale the pixmap to fit the current size of the video_label while preserving aspect ratio
+        label_size = self.video_label.size()
+        scaled_pixmap = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        
+        # Set the scaled pixmap
+        self.video_label.setPixmap(scaled_pixmap)
 
     # Removed line_crossed method as we're only using polygon-based counting
     
@@ -984,11 +1063,21 @@ class VehicleDetectionApp(QMainWindow):
         # Check for any remaining completed tracks
         self.check_for_completed_tracks()
         
-        # Log the total counts to the results
-        self.results_text.append("\nFinal vehicle counts:")
+        # Log the total counts to the results using HTML format for two columns
+        html_content = "<html><body style='color:white;'>"
+        html_content += "<h3 style='color:#4CAF50;'>Final Vehicle Counts</h3>"
+        html_content += "<table style='width:100%;'>"
+        
         for cls_name, count in self.unique_vehicle_counts.items():
-            self.results_text.append(f"{cls_name}: {count}")
-        self.results_text.append(f"\nDetection data logged to {self.csv_filename}")
+            # Add spaces to create alignment, minimum 20 chars width, right-aligned
+            padded_class = f"{cls_name}{' ' * 30}"  # Add plenty of spaces after class name
+            html_content += f"<tr><td style='padding:5px; white-space: pre;'>{padded_class}</td><td style='padding:5px;'>{count}</td></tr>"
+        
+        html_content += "</table>"
+        html_content += f"<p>Detection data logged to {self.csv_filename}</p>"
+        html_content += "</body></html>"
+        
+        self.sidebar_counts.setHtml(html_content)
         
         # Save final counter state
         self.save_counter_state()
@@ -1001,6 +1090,14 @@ class VehicleDetectionApp(QMainWindow):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+    
+    def resizeEvent(self, event):
+        """Handle resize events to update video display"""
+        super().resizeEvent(event)
+        # If we have a current frame, update the display to fit the new size
+        if hasattr(self, 'latest_frame') and self.latest_frame is not None:
+            # Force an update of the video display on resize
+            self.update_frame()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
